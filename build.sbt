@@ -32,7 +32,7 @@ lazy val sharedSettings: Seq[SettingsDefinition] = Seq(
   useGpg := false,
   pgpPublicRing := file(sys.env.getOrElse("GPG_DIR", "")) / "pubring.gpg",
   pgpSecretRing := file(sys.env.getOrElse("GPG_DIR", "")) / "/secring.gpg",
-  usePgpKeyHex(sys.env.getOrElse("GPG_KEY_HEX", "")),
+  usePgpKeyHex(sys.env.getOrElse("GPG_KEY_HEX", "0")),
   pgpPassphrase := Some(sys.env.getOrElse("GPG_PASSPHRASE", "")).map(_.toCharArray)
 )
 

@@ -3,12 +3,19 @@ package ch.timo_schmid.sbt.dockerRun
 import play.api.libs.json._
 import sbt._
 import sbt.Keys._
+
 import scala.language.implicitConversions
 import scala.sys.process.Process
 
 object DockerRunPlugin extends AutoPlugin {
 
   object autoImport {
+
+    final case class DockerContainer(id: String,
+                                     name: String,
+                                     version: String = "latest",
+                                     ports: Seq[PortMapping] = Seq(),
+                                     environment: Map[String, String] = Map())
 
     implicit def toPortOps(port: Int): PortOps =
       new PortOps(port)
@@ -31,16 +38,19 @@ object DockerRunPlugin extends AutoPlugin {
       dockerRun.value
       (run in Compile).evaluated
     },
-    dockerRun := { runDocker(dockerContainers.value) },
+    dockerRun := { runDocker(streams.value.log)(dockerContainers.value) },
     dockerContainers := Nil
   )
 
-  private def runDocker(dockerContainers: Seq[DockerContainer]): Seq[DockerContainer] =
-    dockerContainers.map(runDockerContainer)
+  private def runDocker(log: Logger)(dockerContainers: Seq[DockerContainer]): Seq[DockerContainer] =
+    dockerContainers.map(runDockerContainer(log))
 
-  private def runDockerContainer(container: DockerContainer): DockerContainer = {
-    if(!dockerContainerIsRunning(container)) {
-      startDockerContainer(container)
+  private def runDockerContainer(log: Logger)(container: DockerContainer): DockerContainer = {
+    if(!dockerContainerIsRunning(log)(container)) {
+      startDockerContainer(log)(container)
+      log.info(s"Started ${container.name}:${container.version} as ${container.id}")
+    } else {
+      log.info(s"Docker container ${container.id} is up-to-date.")
     }
     container
   }
@@ -48,7 +58,7 @@ object DockerRunPlugin extends AutoPlugin {
   // TODO (timo) Make this a setting
   lazy val dockerBin: String = Process("which docker").!!.split("\n").head
 
-  private def dockerContainerIsRunning(container: DockerContainer): Boolean = {
+  private def dockerContainerIsRunning(log: Logger)(container: DockerContainer): Boolean = {
     val dockerPsCmd = s"""$dockerBin ps -a""" // not working: --format "{{.ID}} {{.Names}}"
     val dockerPs: String = Process(dockerPsCmd).!!
     val containerLines = dockerPs.split("\n").tail
@@ -58,10 +68,9 @@ object DockerRunPlugin extends AutoPlugin {
       val containerName = infos.last
       if (container.id == containerName)
         if (isContainerUpToDate(containerId, container)) {
-          println(s"Docker container $containerName is up-to-date.")
           true
         } else {
-          removeDockerContainer(containerId)
+          removeDockerContainer(log)(containerId)
           false
         }
       else
@@ -116,18 +125,16 @@ object DockerRunPlugin extends AutoPlugin {
         .contains(s"$k=$v")
     }
 
-  private def removeDockerContainer(containerId: String): Unit = {
+  private def removeDockerContainer(log: Logger)(containerId: String): Unit = {
     Process(s"""$dockerBin rm -f $containerId""").!!
-    println(s"Removed: $containerId")
+    log.debug(s"Removed: $containerId")
   }
 
-  private def startDockerContainer(container: DockerContainer): Unit = {
-    println(s"Starting ${container.name}:${container.version} as ${container.id}")
+  private def startDockerContainer(log: Logger)(container: DockerContainer): Unit = {
     val containerPorts = container.ports.map(port => s"-p ${port.local}:${port.container}").mkString(" ")
     val containerEnv = container.environment.toSeq.map{ case (k: String, v: String) => s"-e $k=$v" }.mkString(" ")
     val dockerRunCommand = s"""$dockerBin run --name ${container.id} -d $containerPorts $containerEnv ${container.name}:${container.version}"""
-    val containerId: String = Process(dockerRunCommand).!!
-    println(s"Started: $containerId")
+    Process(dockerRunCommand).!!
   }
 
 }
