@@ -15,7 +15,8 @@ object DockerRunPlugin extends AutoPlugin {
                                      name: String,
                                      version: String = "latest",
                                      ports: Seq[PortMapping] = Seq(),
-                                     environment: Map[String, String] = Map())
+                                     environment: Map[String, String] = Map(),
+                                     volumes: Map[File, String] = Map())
 
     implicit def toPortOps(port: Int): PortOps =
       new PortOps(port)
@@ -87,14 +88,17 @@ object DockerRunPlugin extends AutoPlugin {
     isUp(jsonContainer) &&
       compareImage(jsonContainer, container.name, container.version) &&
       comparePorts(jsonContainer, container.ports) &&
-      compareEnvVars(jsonContainer, container.environment)
+      compareEnvVars(jsonContainer, container.environment) &&
+      compareVolumes(jsonContainer, container.volumes)
   }
+
+  private final val RUNNING = "running"
 
   private def isUp(value: JsValue): Boolean =
     value
       .field("State")
       .field("Status")
-      .asString == "running"
+      .asString == RUNNING
 
   private def compareImage(jsObject: JsValue, image: String, version: String): Boolean =
     jsObject
@@ -125,6 +129,19 @@ object DockerRunPlugin extends AutoPlugin {
         .contains(s"$k=$v")
     }
 
+  private def compareVolumes(jsObject: JsValue, volumes: Map[File, String]): Boolean =
+    volumes.toSeq.forall { case (source, destination) =>
+      jsObject
+        .field("Mounts")
+        .asArray
+        .exists {jsNode =>
+          jsNode.field("Type").asString == "volume" &&
+          jsNode.field("Driver").asString == "local" &&
+          jsNode.field("Source").asString == source.getAbsolutePath &&
+          jsNode.field("Destination").asString == destination
+        }
+    }
+
   private def removeDockerContainer(log: Logger)(containerId: String): Unit = {
     Process(s"""$dockerBin rm -f $containerId""").!!
     log.debug(s"Removed: $containerId")
@@ -133,7 +150,8 @@ object DockerRunPlugin extends AutoPlugin {
   private def startDockerContainer(log: Logger)(container: DockerContainer): Unit = {
     val containerPorts = container.ports.map(port => s"-p ${port.local}:${port.container}").mkString(" ")
     val containerEnv = container.environment.toSeq.map{ case (k: String, v: String) => s"-e $k=$v" }.mkString(" ")
-    val dockerRunCommand = s"""$dockerBin run --name ${container.id} -d $containerPorts $containerEnv ${container.name}:${container.version}"""
+    val containerVolumes = container.volumes.toSeq.map{ case (k: File, v: String) => s"-v ${k.getAbsolutePath}:$v" }.mkString(" ")
+    val dockerRunCommand = s"""$dockerBin run --name ${container.id} -d $containerPorts $containerEnv $containerVolumes ${container.name}:${container.version}"""
     Process(dockerRunCommand).!!
   }
 

@@ -29,6 +29,9 @@ lazy val root = (project in file("."))
           "MYSQL_DATABASE"      -> s"db_myapp",
           "MYSQL_USER"          -> "db",
           "MYSQL_PASSWORD"      -> "123456"
+        ),
+        volumes = Map(
+          file("./data/mysql") -> "/var/lib/mysql"
         )
       )
     )
@@ -75,3 +78,7 @@ Running main()
 [success] Total time: 1 s, completed 05.07.2018 15:13:43
 1. Waiting for source changes... (press enter to interrupt)
 ```
+
+## Demo
+
+https://github.com/timo-schmid/sbt-docker-run-demo
