@@ -1,5 +1,6 @@
 
 lazy val sharedSettings: Seq[SettingsDefinition] = Seq(
+  version := "0.3.0-SNAPSHOT",
   publishMavenStyle := true,
   licenses += ("Apache-2.0", url("https://www.apache.org/licenses/LICENSE-2.0.html")),
   homepage := Some(url("https://github.com/timo-schmid/sbt-docker-run")),
