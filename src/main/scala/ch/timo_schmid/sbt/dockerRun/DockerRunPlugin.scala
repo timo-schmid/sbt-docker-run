@@ -163,17 +163,21 @@ object DockerRunPlugin extends AutoPlugin {
                                 (container: DockerContainer): Option[JobHandle] = {
     synchronized {
       val inspectResult = runDockerInspect(log, dockerBinary, container)
-      if (dockerContainerIsRunning(inspectResult)) {
+      if (dockerContainerExists(inspectResult)) {
         if (dockerContainerIsUpToDate(inspectResult, container)) {
-          log.info(s"Docker container ${container.name} is up-to-date.")
-          None
+          if (dockerContainerIsRunning(inspectResult)) {
+            log.info(s"Docker container ${container.name} is up-to-date and already running.")
+            None
+          } else {
+            log.info(s"Docker container ${container.name} is up-to-date.")
+            Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerStart(dockerBinary, _)))
+          }
         } else {
-          stopDockerContainer(dockerBinary, backgroundJobService, log)(container)
           runDockerRemove(dockerBinary, container, log)
-          Some(startDockerContainer(dockerBinary, container, backgroundJobService, spawningTask, state))
+          Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
         }
       } else {
-        Some(startDockerContainer(dockerBinary, container, backgroundJobService, spawningTask, state))
+        Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
       }
     }
   }
@@ -203,13 +207,21 @@ object DockerRunPlugin extends AutoPlugin {
                                container: DockerContainer): Either[Int, JsObject] = {
     val dockerInspectCmd = List(dockerBinary, "inspect", container.name)
     log.debug(s"Docker inspect command: ${dockerInspectCmd.mkString(" ")}")
-    val containerLines = mutable.StringBuilder.newBuilder
-    val processLogger = ProcessLogger(line => containerLines :+ line, _ => ())
+    val inspectLines = new mutable.StringBuilder
+    val inspectErrorLines = new mutable.StringBuilder
+    val processLogger = ProcessLogger(line => inspectLines ++= line += '\n', line => inspectErrorLines ++= line += '\n')
     val dockerInspect = Process(dockerInspectCmd).run(processLogger)
     val exitValue = dockerInspect.exitValue()
+    val inspectOutput = inspectLines.toString
+    log.debug(s"Docker inspect output:\n$inspectOutput")
+    val inspectErrors = inspectLines.toString
+    log.debug(s"Docker inspect errors:\n$inspectErrors")
     if (exitValue != 0) Left(exitValue)
-    else Right(Json.parse(containerLines.toString).as[List[JsObject]].head)
+    else Right(Json.parse(inspectOutput).as[List[JsObject]].head)
   }
+
+  private def dockerContainerExists(inspectResult: Either[Int, JsObject]): Boolean =
+    inspectResult.isRight
 
   private def dockerContainerIsRunning(inspectResult: Either[Int, JsObject]): Boolean =
     inspectResult.exists(isUp)
@@ -321,18 +333,20 @@ object DockerRunPlugin extends AutoPlugin {
       case Digest(value) =>s"${container.image}@$value"
     }
 
-  private def startDockerContainer(dockerBinary: String,
-                                   container: DockerContainer,
-                                   backgroundJobService: BackgroundJobService,
-                                   spawningTask: ScopedKey[_],
-                                   state: State): JobHandle = {
-    val jobHandle = backgroundJobService.runInBackground(spawningTask, state)(runDockerRun(dockerBinary))
+  private def scheduleDockerJob(container: DockerContainer,
+                                backgroundJobService: BackgroundJobService,
+                                spawningTask: ScopedKey[_],
+                                state: State)
+                               (start: DockerContainer => (Logger, File) => Unit): JobHandle = {
+    val jobHandle = backgroundJobService.runInBackground(spawningTask, state)(start(container))
     containers.put(container.name, jobHandle)
+    backgroundJobService.jobs
     jobHandle
   }
 
-  private def runDockerRun(dockerBinary: String)(log: Logger, workingDir: File)(
-      container: DockerContainer): Unit = {
+  private def runDockerRun(dockerBinary: String, container: DockerContainer)(log: Logger, workingDir: File): Unit = {
+    val image = containerImage(container)
+    log.info(s"Running $image as ${container.name}.")
     val dockerRunCommand =
       List(dockerBinary, "run") ++:
         containerNameOptions(container) ++:
@@ -340,8 +354,14 @@ object DockerRunPlugin extends AutoPlugin {
         containerEnvOptions(container) ++:
         containerVolumesOptions(container) ++:
         container.options ++:
-        containerImage(container) +:
+        image +:
         container.command
+    runDockerProcessWithIO(dockerRunCommand, container, log, workingDir)
+  }
+
+  private def runDockerStart(dockerBinary: String, container: DockerContainer)(log: Logger, workingDir: File): Unit = {
+    log.info(s"Starting ${container.name}.")
+    val dockerStartCommand = List(dockerBinary, "run", container.name)
     val io: ProcessIO = {
       new ProcessIO(
         container.stdin,
@@ -350,9 +370,20 @@ object DockerRunPlugin extends AutoPlugin {
         false
       )
     }
-    log.info(s"Staring ${container.name}:${container.version} as ${container.name}.")
-    log.debug(s"Docker run command: ${dockerRunCommand.mkString(" ")}")
-    val process = Process(dockerRunCommand, workingDir).run(io)
+    runDockerProcessWithIO(dockerStartCommand, container, log, workingDir)
+  }
+
+  private def runDockerProcessWithIO(command: List[String], container: DockerContainer, log: Logger, workingDir: File): Unit = {
+    val io: ProcessIO = {
+      new ProcessIO(
+        container.stdin,
+        container.stdout,
+        container.stderr,
+        false
+      )
+    }
+    log.debug(s"Docker command: ${command.mkString(" ")}")
+    val process = Process(command, workingDir).run(io)
     container.readyCheck(container)
     // Block here until the background job service interrupts the current thread.
     val exitValue = process.exitValue()
