@@ -86,6 +86,7 @@ object DockerRunPlugin extends AutoPlugin {
                                      version: Version = Tag.latest,
                                      ports: List[PortMapping] = Nil,
                                      environment: Map[String, String] = Map.empty,
+                                     defaultEnvironment: Set[String] = Set("PATH"),
                                      volumes: Map[File, String] = Map.empty,
                                      options: List[String] = Nil,
                                      command: List[String] = Nil,
@@ -164,8 +165,8 @@ object DockerRunPlugin extends AutoPlugin {
     synchronized {
       val inspectResult = runDockerInspect(log, dockerBinary, container)
       if (dockerContainerExists(inspectResult)) {
-        if (dockerContainerIsUpToDate(inspectResult, container)) {
-          if (dockerContainerIsRunning(inspectResult)) {
+        if (dockerContainerIsUpToDate(inspectResult, container, log)) {
+          if (dockerContainerIsRunning(inspectResult, log)) {
             log.info(s"Docker container ${container.name} is up-to-date and already running.")
             None
           } else {
@@ -173,6 +174,10 @@ object DockerRunPlugin extends AutoPlugin {
             Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerStart(dockerBinary, _)))
           }
         } else {
+          log.info(s"Docker container ${container.name} is out-of-date.")
+          if (dockerContainerIsRunning(inspectResult, log)) {
+            runDockerStop(dockerBinary, container, log)
+          }
           runDockerRemove(dockerBinary, container, log)
           Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
         }
@@ -188,7 +193,7 @@ object DockerRunPlugin extends AutoPlugin {
                                  (container: DockerContainer): Unit = {
     synchronized {
       val inspectResult = runDockerInspect(log, dockerBinary, container)
-      if (dockerContainerIsRunning(inspectResult)) {
+      if (dockerContainerIsRunning(inspectResult, log)) {
         runDockerStop(dockerBinary, container, log)
       }
       containers.remove(container.name).foreach(backgroundJobService.waitFor)
@@ -223,87 +228,140 @@ object DockerRunPlugin extends AutoPlugin {
   private def dockerContainerExists(inspectResult: Either[Int, JsObject]): Boolean =
     inspectResult.isRight
 
-  private def dockerContainerIsRunning(inspectResult: Either[Int, JsObject]): Boolean =
-    inspectResult.exists(isUp)
+  private def dockerContainerIsRunning(inspectResult: Either[Int, JsObject], log: Logger): Boolean =
+    inspectResult.exists(isUp(_, log))
 
   private implicit def toJsValueOps(jsValue: JsValue): JsValueOps =
     new JsValueOps(jsValue)
 
-  private def dockerContainerIsUpToDate(inspectResult: Either[Int, JsObject], container: DockerContainer): Boolean = {
+  private def dockerContainerIsUpToDate(inspectResult: Either[Int, JsObject],
+                                        container: DockerContainer,
+                                        log: Logger): Boolean = {
     inspectResult match {
       case Left(_) => false
       case Right(jsonContainer) =>
-        isUp(jsonContainer) &&
-          compareImage(jsonContainer, containerImage(container)) &&
-          comparePorts(jsonContainer, container.ports) &&
-          compareEnvVars(jsonContainer, container.environment) &&
-          compareVolumes(jsonContainer, container.volumes) &&
-          compareCommand(jsonContainer, container.command) &&
+        isUp(jsonContainer, log) &&
+          compareImage(jsonContainer, containerImage(container), log) &&
+          comparePorts(jsonContainer, container.ports, log) &&
+          compareEnvVars(jsonContainer, container.environment, container.defaultEnvironment, log) &&
+          compareVolumes(jsonContainer, container.volumes, log) &&
+          compareCommand(jsonContainer, container.command, log) &&
           container.options.isEmpty // Assume arbitrary options are out of date without a way to compare them.
     }
   }
 
   private final val RUNNING = "running"
 
-  private def isUp(value: JsValue): Boolean =
-    value
+  private def isUp(value: JsValue, log: Logger): Boolean = {
+    val status = value
       .field("State")
       .field("Status")
-      .as[String] == RUNNING
+      .as[String]
+    if (status == RUNNING) {
+      true
+    } else {
+      log.debug(s"State.Status $status is not $RUNNING.")
+      false
+    }
+  }
 
-  private def compareImage(jsObject: JsValue, image: String): Boolean =
-    jsObject
+  private def compareImage(jsObject: JsValue, image: String, log: Logger): Boolean = {
+    val actualImage = jsObject
       .field("Config")
       .field("Image")
-      .as[String] == image
+      .as[String]
+    if (actualImage == image) {
+      true
+    } else {
+      log.debug(s"Config.Image $actualImage is not $image.")
+      false
+    }
+  }
 
   private def comparePorts(jsObject: JsValue,
-                           ports: Seq[PortMapping]): Boolean =
-    ports.forall { portMapping =>
-      jsObject
-        .field("HostConfig")
-        .field("PortBindings")
-        .field(s"${portMapping.local}/tcp")
-        .as[List[JsValue]]
-        .exists { portBinding =>
-          portBinding
-            .field("HostPort")
-            .as[String] == s"${portMapping.container}"
-        }
+                           ports: Seq[PortMapping],
+                           log: Logger): Boolean = {
+    val actual: JsValue = jsObject
+      .field("HostConfig")
+      .field("PortBindings")
+    val expected: JsValue = new JsObject(ports.foldLeft(Map.empty[String, JsArray]) {
+      case (map, portMapping) =>
+        val local = s"${portMapping.local}/tcp"
+        val mappings = map.getOrElse(local, JsArray.empty)
+        val mapping = JsObject(Seq("HostIp" -> JsString(""), "HostPort" -> JsString(portMapping.container.toString)))
+        val updatedMappings = mappings :+ mapping
+        map + (local -> updatedMappings)
+    })
+    if (actual == expected) {
+      true
+    } else {
+      log.debug(s"HostConfig.PortBindings: ${Json.prettyPrint(actual)} is not ${Json.prettyPrint(expected)}.")
+      false
     }
+  }
 
   private def compareEnvVars(jsObject: JsValue,
-                             environment: Map[String, String]): Boolean =
-    environment.toSeq.forall {
-      case (k, v) =>
-        jsObject
-          .field("Config")
-          .field("Env")
-          .as[List[String]]
-          .contains(s"$k=$v")
+                             environment: Map[String, String],
+                             ignore: Set[String],
+                             log: Logger): Boolean = {
+    // Some environment variables are specified in the Dockerfile.
+    val actual = jsObject
+      .field("Config")
+      .field("Env")
+      .as[List[String]]
+      .filterNot { value =>
+        val key = value.takeWhile(_ != '=')
+        ignore.contains(key)
+      }
+    val expected = environment.map {
+      case (k, v) => s"$k=$v"
     }
+    if (actual == expected) {
+      true
+    } else {
+      log.debug(s"Config.Env: $actual is not $expected.")
+      false
+    }
+  }
 
   private def compareVolumes(jsObject: JsValue,
-                             volumes: Map[File, String]): Boolean =
-    volumes.toSeq.forall {
-      case (source, destination) =>
-        jsObject
-          .field("Mounts")
-          .as[List[JsValue]]
-          .exists { jsNode =>
-            jsNode.field("Type").as[String] == "volume" &&
-              jsNode.field("Driver").as[String] == "local" &&
-              jsNode.field("Source").as[String] == source.getAbsolutePath &&
-              jsNode.field("Destination").as[String] == destination
-          }
+                             volumes: Map[File, String],
+                             log: Logger): Boolean = {
+    val actual = jsObject
+      .field("Mounts")
+    val expected = JsArray(volumes.map {
+      case (file, volume) =>
+        JsObject(Seq(
+          "Type" -> JsString("bind"),
+          "Source" -> JsString(file.getAbsolutePath),
+          "Destination" -> JsString(volume),
+          "Mode" -> JsString(""),
+          "RW" -> JsBoolean(true),
+          "Propagation" -> JsString("rprivate"),
+        ))
+    }.toSeq)
+    if (actual == expected) {
+      true
+    } else {
+      log.debug(s"Mounts: ${Json.prettyPrint(actual)} is not ${Json.prettyPrint(expected)}.")
+      false
     }
+  }
 
   private def compareCommand(jsObject: JsValue,
-                             command: List[String]): Boolean =
-    jsObject
+                             command: List[String],
+                             log: Logger): Boolean = {
+    val actual = jsObject
       .field("Config")
       .field("Cmd")
-      .as[List[String]] == command
+      .as[List[String]]
+    if (actual == command) {
+      true
+    } else {
+      log.debug(s"Mounts: $actual is not $command.")
+      false
+    }
+  }
 
   private def runDockerRemove(dockerBinary: String, container: DockerContainer, log: Logger): Unit = {
     log.info(s"Removing ${container.name}.")
@@ -362,14 +420,6 @@ object DockerRunPlugin extends AutoPlugin {
   private def runDockerStart(dockerBinary: String, container: DockerContainer)(log: Logger, workingDir: File): Unit = {
     log.info(s"Starting ${container.name}.")
     val dockerStartCommand = List(dockerBinary, "run", container.name)
-    val io: ProcessIO = {
-      new ProcessIO(
-        container.stdin,
-        container.stdout,
-        container.stderr,
-        false
-      )
-    }
     runDockerProcessWithIO(dockerStartCommand, container, log, workingDir)
   }
 
@@ -386,8 +436,12 @@ object DockerRunPlugin extends AutoPlugin {
     val process = Process(command, workingDir).run(io)
     container.readyCheck(container)
     // Block here until the background job service interrupts the current thread.
-    val exitValue = process.exitValue()
-    container.onExit(exitValue)
+    try {
+      val exitValue = process.exitValue()
+      container.onExit(exitValue)
+    } catch {
+      case _: InterruptedException => // Time to stop.
+    }
   }
 
 }
