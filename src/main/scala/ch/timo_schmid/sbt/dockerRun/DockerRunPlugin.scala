@@ -219,7 +219,7 @@ object DockerRunPlugin extends AutoPlugin {
     val exitValue = dockerInspect.exitValue()
     val inspectOutput = inspectLines.toString
     log.debug(s"Docker inspect output:\n$inspectOutput")
-    val inspectErrors = inspectLines.toString
+    val inspectErrors = inspectErrorLines.toString
     log.debug(s"Docker inspect errors:\n$inspectErrors")
     if (exitValue != 0) Left(exitValue)
     else Right(Json.parse(inspectOutput).as[List[JsObject]].head)
