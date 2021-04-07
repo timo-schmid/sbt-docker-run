@@ -358,7 +358,7 @@ object DockerRunPlugin extends AutoPlugin {
     if (actual == command) {
       true
     } else {
-      log.debug(s"Mounts: $actual is not $command.")
+      log.debug(s"Config.Cmd: $actual is not $command.")
       false
     }
   }
