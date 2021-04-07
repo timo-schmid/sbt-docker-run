@@ -44,6 +44,8 @@ lazy val plugin = (project in file("."))
     description := "A docker runtime wrapper - like docker compose - for SBT.",
     organization := "ch.timo-schmid",
     libraryDependencies += "com.typesafe.play" %% "play-json" % "2.6.9",
-    scalacOptions ++= Seq("-unchecked", "-deprecation", "-feature")
+    libraryDependencies += "com.lihaoyi" %% "utest" % "0.7.7" % Test,
+    scalacOptions ++= Seq("-unchecked", "-deprecation", "-feature"),
+    testFrameworks += new TestFramework("utest.runner.Framework")
   )
   .settings(sharedSettings: _*)

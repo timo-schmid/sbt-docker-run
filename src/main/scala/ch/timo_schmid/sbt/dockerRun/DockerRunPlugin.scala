@@ -1,5 +1,6 @@
 package ch.timo_schmid.sbt.dockerRun
 
+import ch.timo_schmid.sbt.dockerRun.PortOps.ContainerPort
 import play.api.libs.functional.syntax._
 import play.api.libs.json.Reads._
 import play.api.libs.json._
@@ -126,6 +127,11 @@ object DockerRunPlugin extends AutoPlugin {
         }.toSeq)
       }
     }
+
+    val dockerLocalhost: String = "127.0.0.1"
+
+    implicit def toContainerPort(containerPort: Int): ContainerPort =
+      ContainerPort(containerPort)
 
     implicit def toPortOps(port: Int): PortOps =
       new PortOps(port)
@@ -382,7 +388,7 @@ object DockerRunPlugin extends AutoPlugin {
 
   private def containerPortsOptions(container: DockerContainer): List[String] =
     container.ports
-      .flatMap(port => List("-p", s"${port.local}:${port.container}"))
+      .flatMap(port => List("-p", port.toString))
 
   private def containerEnvOptions(container: DockerContainer): List[String] =
     container.environment.toList
