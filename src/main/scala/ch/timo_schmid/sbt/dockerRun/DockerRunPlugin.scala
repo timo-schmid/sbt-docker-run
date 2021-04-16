@@ -1,13 +1,14 @@
 package ch.timo_schmid.sbt.dockerRun
 
-import java.io.{BufferedWriter, FileWriter, InputStream, OutputStream}
-
+import play.api.libs.functional.syntax._
+import play.api.libs.json.Reads._
 import play.api.libs.json._
 import sbt.Keys._
 import sbt._
 
+import java.io.{BufferedWriter, FileWriter, InputStream, OutputStream}
 import scala.collection.mutable
-import scala.language.implicitConversions
+import scala.language.{implicitConversions, postfixOps}
 import scala.sys.process.{Process, ProcessIO, ProcessLogger}
 import scala.util.Try
 
@@ -16,7 +17,7 @@ object DockerRunPlugin extends AutoPlugin {
   object autoImport {
 
     private def logToLogger(logger: Logger)(
-        logFn: Logger => String => Unit): InputStream => Unit =
+      logFn: Logger => String => Unit): InputStream => Unit =
       inputStream => {
         val src = scala.io.Source.fromInputStream(inputStream)
         src.getLines().foreach(line => logFn(logger)(line))
@@ -86,7 +87,6 @@ object DockerRunPlugin extends AutoPlugin {
                                      version: Version = Tag.latest,
                                      ports: List[PortMapping] = Nil,
                                      environment: Map[String, String] = Map.empty,
-                                     defaultEnvironment: Set[String] = Set("PATH"),
                                      volumes: Map[File, String] = Map.empty,
                                      options: List[String] = Nil,
                                      command: List[String] = Nil,
@@ -95,6 +95,37 @@ object DockerRunPlugin extends AutoPlugin {
                                      stdout: InputStream => Unit = _ => (),
                                      stderr: InputStream => Unit = _ => (),
                                      onExit: Int => Unit = _ => ())
+
+    object DockerContainer {
+
+      implicit val writes: OWrites[DockerContainer] = OWrites { container =>
+        JsObject(List(
+          "Config" -> JsObject(List(
+            "Cmd" -> Json.toJson(container.command),
+            "Env" -> Json.toJson(container.environment.map({ case (k, v) => s"$k=$v" })),
+            "Image" -> JsString(containerImage(container))
+          )),
+          "HostConfig" -> JsObject(List(
+            "PortBindings" -> Json.toJson(container.ports)
+          )),
+          "Mounts" -> writeVolumes(container.volumes)
+        ))
+      }
+
+      private def writeVolumes(volumes: Map[File, String]): JsArray = {
+        JsArray(volumes.map {
+          case (file, volume) =>
+            JsObject(Seq(
+              "Type" -> JsString("bind"),
+              "Source" -> JsString(file.getAbsolutePath),
+              "Destination" -> JsString(volume),
+              "Mode" -> JsString(""),
+              "RW" -> JsBoolean(true),
+              "Propagation" -> JsString("rprivate"),
+            ))
+        }.toSeq)
+      }
+    }
 
     implicit def toPortOps(port: Int): PortOps =
       new PortOps(port)
@@ -162,27 +193,30 @@ object DockerRunPlugin extends AutoPlugin {
                                  log: Logger,
                                  state: State)
                                 (container: DockerContainer): Option[JobHandle] = {
-    synchronized {
+    // Synchronize here for the unlikely case where the stop task is running at the same time.
+    containers.synchronized {
+      val imageInspectOutput = runDockerImageInspect(log, dockerBinary, container)
       val inspectResult = runDockerInspect(log, dockerBinary, container)
-      if (dockerContainerExists(inspectResult)) {
-        if (dockerContainerIsUpToDate(inspectResult, container, log)) {
-          if (dockerContainerIsRunning(inspectResult, log)) {
-            log.info(s"Docker container ${container.name} is up-to-date and already running.")
-            None
+      inspectResult match {
+        case Right(inspectOutput) =>
+          if (upToDate(imageInspectOutput, inspectOutput, container, log)) {
+            if (statusUp(inspectOutput, log)) {
+              log.info(s"Docker container ${container.name} is up-to-date and already running.")
+              None
+            } else {
+              log.info(s"Docker container ${container.name} is up-to-date.")
+              Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerStart(dockerBinary, _)))
+            }
           } else {
-            log.info(s"Docker container ${container.name} is up-to-date.")
-            Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerStart(dockerBinary, _)))
+            log.info(s"Docker container ${container.name} is out-of-date.")
+            if (statusUp(inspectOutput, log)) {
+              runDockerStop(dockerBinary, container, log)
+            }
+            runDockerRemove(dockerBinary, container, log)
+            Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
           }
-        } else {
-          log.info(s"Docker container ${container.name} is out-of-date.")
-          if (dockerContainerIsRunning(inspectResult, log)) {
-            runDockerStop(dockerBinary, container, log)
-          }
-          runDockerRemove(dockerBinary, container, log)
+        case _ =>
           Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
-        }
-      } else {
-        Some(scheduleDockerJob(container, backgroundJobService, spawningTask, state)(runDockerRun(dockerBinary, _)))
       }
     }
   }
@@ -191,9 +225,10 @@ object DockerRunPlugin extends AutoPlugin {
                                   backgroundJobService: BackgroundJobService,
                                   log: Logger)
                                  (container: DockerContainer): Unit = {
-    synchronized {
+    // Synchronize here for the unlikely case where the run task is running at the same time.
+    containers.synchronized {
       val inspectResult = runDockerInspect(log, dockerBinary, container)
-      if (dockerContainerIsRunning(inspectResult, log)) {
+      if (inspectResult.exists(statusUp(_, log))) {
         runDockerStop(dockerBinary, container, log)
       }
       containers.remove(container.name).foreach(backgroundJobService.waitFor)
@@ -211,48 +246,96 @@ object DockerRunPlugin extends AutoPlugin {
                                dockerBinary: String,
                                container: DockerContainer): Either[Int, JsObject] = {
     val dockerInspectCmd = List(dockerBinary, "inspect", container.name)
-    log.debug(s"Docker inspect command: ${dockerInspectCmd.mkString(" ")}")
-    val inspectLines = new mutable.StringBuilder
-    val inspectErrorLines = new mutable.StringBuilder
-    val processLogger = ProcessLogger(line => inspectLines ++= line += '\n', line => inspectErrorLines ++= line += '\n')
-    val dockerInspect = Process(dockerInspectCmd).run(processLogger)
-    val exitValue = dockerInspect.exitValue()
-    val inspectOutput = inspectLines.toString
-    log.debug(s"Docker inspect output:\n$inspectOutput")
-    val inspectErrors = inspectErrorLines.toString
-    log.debug(s"Docker inspect errors:\n$inspectErrors")
-    if (exitValue != 0) Left(exitValue)
-    else Right(Json.parse(inspectOutput).as[List[JsObject]].head)
+    runDockerCommand(log, dockerInspectCmd, "inspect").map(_.as[List[JsObject]].head)
   }
 
-  private def dockerContainerExists(inspectResult: Either[Int, JsObject]): Boolean =
-    inspectResult.isRight
+  private def runDockerImageInspect(log: Logger,
+                                    dockerBinary: String,
+                                    container: DockerContainer): JsObject = {
+    val dockerInspectCmd = List(dockerBinary, "image", "inspect", container.name)
+    runDockerCommand(log, dockerInspectCmd, "image inspect").getOrElse {
+      sys.error(s"Failed to run: ${dockerInspectCmd.mkString(" ")}")
+    }.as[List[JsObject]].head
+  }
 
-  private def dockerContainerIsRunning(inspectResult: Either[Int, JsObject], log: Logger): Boolean =
-    inspectResult.exists(isUp(_, log))
+  private def runDockerCommand(log: Logger,
+                               command: List[String],
+                               description: String): Either[Int, JsValue] = {
+    log.debug(s"Docker $description command: ${command.mkString(" ")}")
+    val stdoutlines = new mutable.Queue[String]()
+    val errorLines = new mutable.Queue[String]()
+    val processLogger = ProcessLogger(line => stdoutlines += line, line => errorLines += line)
+    val dockerProcess = Process(command).run(processLogger)
+    val exitValue = dockerProcess.exitValue()
+    val output = stdoutlines.mkString("\n")
+    log.debug(s"Docker output:\n$output")
+    val errors = errorLines.mkString("\n")
+    log.error(s"Docker errors:\n$errors")
+    if (exitValue != 0) Left(exitValue)
+    else Right(Json.parse(output))
+  }
 
   private implicit def toJsValueOps(jsValue: JsValue): JsValueOps =
     new JsValueOps(jsValue)
 
-  private def dockerContainerIsUpToDate(inspectResult: Either[Int, JsObject],
-                                        container: DockerContainer,
-                                        log: Logger): Boolean = {
-    inspectResult match {
-      case Left(_) => false
-      case Right(jsonContainer) =>
-        isUp(jsonContainer, log) &&
-          compareImage(jsonContainer, containerImage(container), log) &&
-          comparePorts(jsonContainer, container.ports, log) &&
-          compareEnvVars(jsonContainer, container.environment, container.defaultEnvironment, log) &&
-          compareVolumes(jsonContainer, container.volumes, log) &&
-          compareCommand(jsonContainer, container.command, log) &&
-          container.options.isEmpty // Assume arbitrary options are out of date without a way to compare them.
+  private implicit class ReadOps(val reads: Reads[JsObject]) extends AnyVal {
+
+    def orEmpty: Reads[JsObject] = reads.orElse(Reads.pure(JsObject.empty))
+  }
+
+  private def upToDate(imageInspectOutput: JsObject,
+                       inspectOutput: JsObject,
+                       container: DockerContainer,
+                       log: Logger): Boolean = {
+    // Assume arbitrary options are out of date as we have no way to compare them.
+    if (container.options.isEmpty) {
+      log.debug("Container is using arbitrary options.")
+      false
+    } else {
+      val fallback = Reads.pure(imageInspectOutput)
+
+      def withFallback(path: JsPath): Reads[JsObject] = {
+        val pick = Reads.jsPick[JsValue](path)
+        path.json.copyFrom(
+          pick.orElse(fallback.andThen(pick))
+        )
+      }
+
+      def mergeFallback(path: JsPath): Reads[JsObject] = {
+        val pickOrElseEmpty = Reads.jsPick[JsObject](path).orEmpty
+        path.json.copyFrom(
+          for {
+            a <- pickOrElseEmpty
+            b <- fallback.andThen(pickOrElseEmpty)
+          } yield a.deepMerge(b)
+        )
+      }
+
+      val containerJson = Json.toJson(container)
+      val expected = containerJson.transform(
+        (__ \ 'Config).json.update(
+          withFallback(__ \ 'Cmd).orEmpty and
+            mergeFallback(__ \ 'Env) and
+            withFallback(__ \ 'Image) reduce
+        )).get
+      val actual = inspectOutput.transform(
+        (__ \ 'Config).json.pickBranch(
+          (__ \ 'Cmd).json.pickBranch.orEmpty and
+            (__ \ 'Env).json.pickBranch.orEmpty and
+            (__ \ 'Image).json.pickBranch reduce
+        ) and
+          (__ \ 'HostConfig \ 'PortBindings).json.pickBranch.orEmpty and
+          (__ \ 'Mounts).json.pickBranch.orEmpty reduce
+      ).get
+      log.debug(s"Expected: ${Json.prettyPrint(expected)}.")
+      log.debug(s"Actual: ${Json.prettyPrint(actual)}.")
+      expected == actual
     }
   }
 
   private final val RUNNING = "running"
 
-  private def isUp(value: JsValue, log: Logger): Boolean = {
+  private def statusUp(value: JsValue, log: Logger): Boolean = {
     val status = value
       .field("State")
       .field("Status")
@@ -261,104 +344,6 @@ object DockerRunPlugin extends AutoPlugin {
       true
     } else {
       log.debug(s"State.Status $status is not $RUNNING.")
-      false
-    }
-  }
-
-  private def compareImage(jsObject: JsValue, image: String, log: Logger): Boolean = {
-    val actualImage = jsObject
-      .field("Config")
-      .field("Image")
-      .as[String]
-    if (actualImage == image) {
-      true
-    } else {
-      log.debug(s"Config.Image $actualImage is not $image.")
-      false
-    }
-  }
-
-  private def comparePorts(jsObject: JsValue,
-                           ports: Seq[PortMapping],
-                           log: Logger): Boolean = {
-    val actual: JsValue = jsObject
-      .field("HostConfig")
-      .field("PortBindings")
-    val expected: JsValue = new JsObject(ports.foldLeft(Map.empty[String, JsArray]) {
-      case (map, portMapping) =>
-        val local = s"${portMapping.local}/tcp"
-        val mappings = map.getOrElse(local, JsArray.empty)
-        val mapping = JsObject(Seq("HostIp" -> JsString(""), "HostPort" -> JsString(portMapping.container.toString)))
-        val updatedMappings = mappings :+ mapping
-        map + (local -> updatedMappings)
-    })
-    if (actual == expected) {
-      true
-    } else {
-      log.debug(s"HostConfig.PortBindings: ${Json.prettyPrint(actual)} is not ${Json.prettyPrint(expected)}.")
-      false
-    }
-  }
-
-  private def compareEnvVars(jsObject: JsValue,
-                             environment: Map[String, String],
-                             ignore: Set[String],
-                             log: Logger): Boolean = {
-    // Some environment variables are specified in the Dockerfile.
-    val actual = jsObject
-      .field("Config")
-      .field("Env")
-      .as[List[String]]
-      .filterNot { value =>
-        val key = value.takeWhile(_ != '=')
-        ignore.contains(key)
-      }
-    val expected = environment.map {
-      case (k, v) => s"$k=$v"
-    }
-    if (actual == expected) {
-      true
-    } else {
-      log.debug(s"Config.Env: $actual is not $expected.")
-      false
-    }
-  }
-
-  private def compareVolumes(jsObject: JsValue,
-                             volumes: Map[File, String],
-                             log: Logger): Boolean = {
-    val actual = jsObject
-      .field("Mounts")
-    val expected = JsArray(volumes.map {
-      case (file, volume) =>
-        JsObject(Seq(
-          "Type" -> JsString("bind"),
-          "Source" -> JsString(file.getAbsolutePath),
-          "Destination" -> JsString(volume),
-          "Mode" -> JsString(""),
-          "RW" -> JsBoolean(true),
-          "Propagation" -> JsString("rprivate"),
-        ))
-    }.toSeq)
-    if (actual == expected) {
-      true
-    } else {
-      log.debug(s"Mounts: ${Json.prettyPrint(actual)} is not ${Json.prettyPrint(expected)}.")
-      false
-    }
-  }
-
-  private def compareCommand(jsObject: JsValue,
-                             command: List[String],
-                             log: Logger): Boolean = {
-    val actual = jsObject
-      .field("Config")
-      .field("Cmd")
-      .as[List[String]]
-    if (actual == command) {
-      true
-    } else {
-      log.debug(s"Config.Cmd: $actual is not $command.")
       false
     }
   }
@@ -388,7 +373,7 @@ object DockerRunPlugin extends AutoPlugin {
   private def containerImage(container: DockerContainer): String =
     container.version match {
       case Tag(value) => s"${container.image}:$value"
-      case Digest(value) =>s"${container.image}@$value"
+      case Digest(value) => s"${container.image}@$value"
     }
 
   private def scheduleDockerJob(container: DockerContainer,
