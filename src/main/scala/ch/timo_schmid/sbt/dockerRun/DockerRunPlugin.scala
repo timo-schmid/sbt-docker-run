@@ -288,7 +288,7 @@ object DockerRunPlugin extends AutoPlugin {
                        container: DockerContainer,
                        log: Logger): Boolean = {
     // Assume arbitrary options are out of date as we have no way to compare them.
-    if (container.options.isEmpty) {
+    if (container.options.nonEmpty) {
       log.debug("Container is using arbitrary options.")
       false
     } else {
