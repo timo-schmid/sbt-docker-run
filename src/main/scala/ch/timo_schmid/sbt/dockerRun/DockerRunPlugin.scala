@@ -252,7 +252,7 @@ object DockerRunPlugin extends AutoPlugin {
   private def runDockerImageInspect(log: Logger,
                                     dockerBinary: String,
                                     container: DockerContainer): JsObject = {
-    val dockerInspectCmd = List(dockerBinary, "image", "inspect", container.name)
+    val dockerInspectCmd = List(dockerBinary, "image", "inspect", container.image)
     runDockerCommand(log, dockerInspectCmd, "image inspect").getOrElse {
       sys.error(s"Failed to run: ${dockerInspectCmd.mkString(" ")}")
     }.as[List[JsObject]].head
