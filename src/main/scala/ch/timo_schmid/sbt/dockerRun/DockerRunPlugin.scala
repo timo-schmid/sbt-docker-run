@@ -269,8 +269,10 @@ object DockerRunPlugin extends AutoPlugin {
     val exitValue = dockerProcess.exitValue()
     val output = stdoutlines.mkString("\n")
     log.debug(s"Docker output:\n$output")
-    val errors = errorLines.mkString("\n")
-    log.error(s"Docker errors:\n$errors")
+    if (errorLines.nonEmpty) {
+      val errors = errorLines.mkString("\n")
+      log.error(s"Docker errors:\n$errors")
+    }
     if (exitValue != 0) Left(exitValue)
     else Right(Json.parse(output))
   }
@@ -292,31 +294,51 @@ object DockerRunPlugin extends AutoPlugin {
       log.debug("Container is using arbitrary options.")
       false
     } else {
-      val fallback = Reads.pure(imageInspectOutput)
+      def withFallbackArray(path: JsPath, fallback: Reads[JsValue]): Reads[JsObject] = {
+        val pick = Reads.jsPick[JsArray](path)
+        val pickFallback = fallback.andThen(pick)
+        path.json.copyFrom(
+          pick.flatMap { array =>
+            if (array.value.nonEmpty) {
+              Reads.pure(array)
+            } else {
+              pickFallback
+            }
+          }.orElse(pickFallback)
+        )
+      }
 
-      def withFallback(path: JsPath): Reads[JsObject] = {
+      def withFallback(path: JsPath, fallback: Reads[JsValue]): Reads[JsObject] = {
         val pick = Reads.jsPick[JsValue](path)
         path.json.copyFrom(
           pick.orElse(fallback.andThen(pick))
         )
       }
 
-      def mergeFallback(path: JsPath): Reads[JsObject] = {
-        val pickOrElseEmpty = Reads.jsPick[JsObject](path).orEmpty
+      def mergeFallbackEnv(path: JsPath, fallback: Reads[JsValue]): Reads[JsObject] = {
+        val pickOrElseEmpty = Reads.jsPick[JsValue](path)
+          .andThen(Reads.of[List[String]])
+          .orElse(Reads.pure(Nil))
         path.json.copyFrom(
           for {
             a <- pickOrElseEmpty
             b <- fallback.andThen(pickOrElseEmpty)
-          } yield a.deepMerge(b)
+          } yield {
+            def key(s: String) = s.takeWhile(_ != '=')
+            val aKeys = a.map(key).toSet
+            val bUnique = b.filterNot(s => aKeys.contains(key(s)))
+            JsArray((a ++ bUnique).map(JsString))
+          }
         )
       }
 
+      val configFallback = Reads.pure(imageInspectOutput).andThen((__ \ 'Config).json.pick)
       val containerJson = Json.toJson(container)
       val expected = containerJson.transform(
         (__ \ 'Config).json.update(
-          withFallback(__ \ 'Cmd).orEmpty and
-            mergeFallback(__ \ 'Env) and
-            withFallback(__ \ 'Image) reduce
+          withFallbackArray(__ \ 'Cmd, configFallback).orEmpty and
+            mergeFallbackEnv(__ \ 'Env, configFallback) and
+            withFallback(__ \ 'Image, configFallback) reduce
         )).get
       val actual = inspectOutput.transform(
         (__ \ 'Config).json.pickBranch(
