@@ -426,7 +426,7 @@ object DockerRunPlugin extends AutoPlugin {
 
   private def runDockerStart(dockerBinary: String, container: DockerContainer)(log: Logger, workingDir: File): Unit = {
     log.info(s"Starting ${container.name}.")
-    val dockerStartCommand = List(dockerBinary, "run", container.name)
+    val dockerStartCommand = List(dockerBinary, "start", container.name)
     runDockerProcessWithIO(dockerStartCommand, container, log, workingDir)
   }
 
